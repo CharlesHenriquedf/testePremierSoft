@@ -1,0 +1,111 @@
+name: CI/CD Pipeline
+on:
+  push:
+    branches:
+      - develop
+      - main
+jobs:
+  lint-test:
+    name: Lint e Testes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do cdigo
+        uses: actions/checkout@v4
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Setup Node.js (para commitlint)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '16'
+      - name: Instalar dependncias Python
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Instalar dependencias JS
+        run: |
+          npm ci
+      - name: Rodar pre-commt hooks
+        # Garantir que o commitlint, black, isort, ruff e bandit rodem
+        run: |
+          source .venv/bin/activate
+          pre-commit run --all-files
+      - name: Executar testes com coverage
+        run: |
+          source .venv/bin/activate
+          pytest --maxfail=1 --disable-warnings -q --cov=app
+        # Coverage mnimo definido em pytest.ini
+      - name: Enviar cobertura para Codecov
+        if: ${{success() }}
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          verbose: true
+  build-push:
+    name: Build e Push Docker
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@v4
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login no Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build da imagem Docker
+        run: |
+          # Tag baseada no SHA do commit
+          IMAGE_TAG=meu-registry/data-api:${{ github.sha }}
+          docker build --pull --tag $IMAGE_TAG .
+      - name: Push da imagem para o registry
+        run: |
+          IMAGE_TAG=meu-registry/data-api:${{ github.sha }}
+          docker push $IMAGE_TAG
+      - name: Scan de vulnerabilidades com Trivy
+        uses: aquasecurity/trivy-action@v0.9.4
+        with:
+          image-ref: meu-registry/data-api:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+        # Se encontrar vulnerabilidades High/Crítico, falha o job
+  deploy:
+    name: Deploy em Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout do cdigo
+        uses: actions/checkout@v4
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      - name: Configurar kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+        # atencao: verfiicar se KUBE_CONFIG_DATA esta configurado
+      - name: Atualizar imagem no Deployment
+        run: |
+          IMAGE_TAG=meu-registry/data-api:${{ github.sha }}
+          kubectl set image deployment/data-api data-api=$IMAGE_TAG --record
+        # Manter rollout history para possibilidade de rollback
+      - name: Verificar rollout status
+        run: |
+          kubectl rollout status deployment/data-api
+        # Aguarda até que os novos pods estejam prontos
+      - name: Limpando arquivo kubeconfig
+        run: |
+          unset KUBECONFIG
+          rm kubeconfig
+      - name: Notificar deploy concluido
+        run: echo "Deploy concludo em $(date '+%d/%m/%Y %H:%M') na branch main"
+        # Gosto de anotar hora pra referencia futura
+
